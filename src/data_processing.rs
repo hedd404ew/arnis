@@ -167,8 +167,6 @@ pub fn generate_world(
     }
     let region_locks = Arc::new(region_locks_map);
 
-    
-
     // Create in-memory resume state protected by a Mutex and a background flusher
     let resume = Arc::new(Mutex::new(if let Some(path) = &args.resume_file { ResumeState::load(path) } else { ResumeState { processed_tiles: Vec::new() } }));
     let resume_path = args.resume_file.clone();

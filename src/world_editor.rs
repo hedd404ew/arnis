@@ -758,7 +758,9 @@ impl<'a> WorldEditor<'a> {
 
         let total_steps: f64 = 9.0;
         let progress_increment_save: f64 = total_steps / total_regions as f64;
-    let current_progress = AtomicU64::new(900);
+    // Initial progress value for save operation (corresponds to 90.0% * 10 for finer granularity)
+    const INITIAL_PROGRESS: u64 = 900;
+    let current_progress = AtomicU64::new(INITIAL_PROGRESS);
         let regions_processed = AtomicU64::new(0);
     let skipped_writes = AtomicU64::new(0);
 
@@ -905,17 +907,6 @@ impl<'a> WorldEditor<'a> {
                         }
 
                         if existing_on_disk.contains(&(chunk_x as usize, chunk_z as usize)) {
-                            continue;
-                        }
-
-                        // Check disk once more (we no longer have region_for_reads after earlier),
-                        // so reuse region_for_reads for this short read check.
-                        let existing_data = region_for_reads
-                            .read_chunk(chunk_x as usize, chunk_z as usize)
-                            .unwrap()
-                            .unwrap_or_default();
-
-                        if !existing_data.is_empty() {
                             continue;
                         }
 

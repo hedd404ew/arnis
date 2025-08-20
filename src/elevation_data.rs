@@ -1,6 +1,7 @@
 use crate::coordinate_system::{geographic::LLBBox, transformation::geo_distance};
 use image::Rgb;
 use std::path::Path;
+use log;
 
 /// Maximum Y coordinate in Minecraft (build height limit)
 const MAX_Y: i32 = 319;
@@ -12,7 +13,7 @@ const AWS_TERRARIUM_URL: &str =
 /// Terrarium format offset for height decoding
 const TERRARIUM_OFFSET: f64 = 32768.0;
 /// Maximum allowed total grid cells (width * height) to avoid huge allocations
-const MAX_GRID_CELLS: usize = 25_000_000; // ~25 million cells (~200MB for f64)
+const MAX_GRID_CELLS: usize = 25_000_000; // ~25 million cells (~200MB for f64, ~100MB for f32)
 /// Maximum kernel size for Gaussian blur (must be odd)
 const MAX_KERNEL_SIZE: usize = 201;
 /// Minimum zoom level for terrain tiles
@@ -80,7 +81,13 @@ pub fn fetch_elevation_data(
         grid_width = (grid_width + 1) / 2; // roughly halve dimensions
         grid_height = (grid_height + 1) / 2;
         total_cells = grid_width.saturating_mul(grid_height);
-        eprintln!("Grid too large, coarsening elevation grid resolution by factor {} -> {}x{} ({} cells)", coarsen_factor, grid_width, grid_height, total_cells);
+        log::warn!(
+            "Grid too large, coarsening elevation grid resolution by factor {} -> {}x{} ({} cells)",
+            coarsen_factor,
+            grid_width,
+            grid_height,
+            total_cells
+        );
         if grid_width == 0 || grid_height == 0 {
             return Err("Coarsening resulted in zero-sized elevation grid".into());
         }
@@ -334,18 +341,16 @@ fn apply_gaussian_blur_memory_efficient(mut heights: Vec<Vec<f64>>, sigma: f64) 
 
     // Clamp sigma to a small positive value to avoid zero division
     let sigma = sigma.max(0.5);
-
     // Cap kernel size to avoid huge per-pixel work
     let mut kernel_size: usize = ((sigma * 3.0).ceil() as usize).saturating_mul(2).saturating_add(1);
     if kernel_size == 0 {
         kernel_size = 1;
     }
     if kernel_size > MAX_KERNEL_SIZE {
-        eprintln!("Capping gaussian kernel size from {} to {}", kernel_size, MAX_KERNEL_SIZE);
+        log::warn!("Capping gaussian kernel size from {} to {}", kernel_size, MAX_KERNEL_SIZE);
         kernel_size = MAX_KERNEL_SIZE;
     }
     let kernel: Vec<f64> = create_gaussian_kernel_capped(kernel_size, sigma);
-
     let height = heights.len();
     let width = heights[0].len();
 
