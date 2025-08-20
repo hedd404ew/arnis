@@ -59,9 +59,29 @@ pub struct Args {
     #[arg(long)]
     pub debug: bool,
 
+    /// Tile size (blocks) to use when splitting the area into batches (optional)
+    #[arg(long, default_value_t = 512)]
+    pub tile_size: i32,
+
+    /// Resume state file path (optional). If provided, generation will skip tiles listed there.
+    #[arg(long)]
+    pub resume_file: Option<String>,
+
+    /// Maximum number of tiles to process in parallel (optional). Use 0 for auto-detect.
+    #[arg(long, default_value_t = 0)]
+    pub max_parallel_tiles: usize,
+
     /// Set floodfill timeout (seconds) (optional)
     #[arg(long, value_parser = parse_duration)]
     pub timeout: Option<Duration>,
+
+    /// Worker mode: process a single tile using the tile file produced by parent
+    #[arg(long)]
+    pub worker: bool,
+
+    /// Path to a tile file (JSON) used in worker mode
+    #[arg(long)]
+    pub tile_file: Option<String>,
 }
 
 fn validate_minecraft_world_path(path: &str) -> Result<String, String> {

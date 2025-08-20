@@ -8,11 +8,14 @@ use fastnbt::{LongArray, Value};
 use fnv::FnvHashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
+use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::sync_channel;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +54,14 @@ struct PaletteItem {
     properties: Option<Value>,
 }
 
+// Small wrapper struct used to serialize the chunk under the "Level" tag
+#[derive(Serialize)]
+struct LevelWrapper<'a> {
+    #[serde(rename = "Level")]
+    level: &'a Chunk,
+}
+
+// Section stored in RAM before serialization
 struct SectionToModify {
     blocks: [Block; 4096],
     // Store properties for blocks that have them, indexed by the same index as blocks array
@@ -120,7 +131,7 @@ impl SectionToModify {
         }
 
         let mut data = vec![];
-        let mut cur = 0;
+        let mut cur: i64 = 0;
         let mut cur_idx = 0;
 
         for (i, &block) in self.blocks.iter().enumerate() {
@@ -718,66 +729,15 @@ impl<'a> WorldEditor<'a> {
             other: chunk.other,
         };
 
-        // Create the Level wrapper
-        let level_data = HashMap::from([(
-            "Level".to_string(),
-            Value::Compound(HashMap::from([
-                ("xPos".to_string(), Value::Int(abs_chunk_x)),
-                ("zPos".to_string(), Value::Int(abs_chunk_z)),
-                ("isLightOn".to_string(), Value::Byte(0)),
-                (
-                    "sections".to_string(),
-                    Value::List(
-                        chunk_data
-                            .sections
-                            .iter()
-                            .map(|section| {
-                                Value::Compound(HashMap::from([
-                                    ("Y".to_string(), Value::Byte(section.y)),
-                                    (
-                                        "block_states".to_string(),
-                                        Value::Compound(HashMap::from([
-                                            (
-                                                "palette".to_string(),
-                                                Value::List(
-                                                    section
-                                                        .block_states
-                                                        .palette
-                                                        .iter()
-                                                        .map(|item| {
-                                                            Value::Compound(HashMap::from([(
-                                                                "Name".to_string(),
-                                                                Value::String(item.name.clone()),
-                                                            )]))
-                                                        })
-                                                        .collect(),
-                                                ),
-                                            ),
-                                            (
-                                                "data".to_string(),
-                                                Value::LongArray(
-                                                    section
-                                                        .block_states
-                                                        .data
-                                                        .clone()
-                                                        .unwrap_or_else(|| LongArray::new(vec![])),
-                                                ),
-                                            ),
-                                        ])),
-                                    ),
-                                ]))
-                            })
-                            .collect(),
-                    ),
-                ),
-            ])),
-        )]);
+    // We serialize using the typed `LevelWrapper` below; no need to construct
+    // a manual HashMap representation here.
 
-        // Serialize the chunk with Level wrapper
-        let mut ser_buffer = Vec::with_capacity(8192);
-        fastnbt::to_writer(&mut ser_buffer, &level_data).unwrap();
+    // Serialize the chunk with Level wrapper using typed struct
+    let mut ser_buffer = Vec::with_capacity(8192);
+    let lw = LevelWrapper { level: &chunk_data };
+    fastnbt::to_writer(&mut ser_buffer, &lw).unwrap();
 
-        (ser_buffer, true)
+    (ser_buffer, true)
     }
 
     /// Saves all changes made to the world by writing modified chunks to the appropriate region files.
@@ -798,23 +758,50 @@ impl<'a> WorldEditor<'a> {
 
         let total_steps: f64 = 9.0;
         let progress_increment_save: f64 = total_steps / total_regions as f64;
-        let current_progress = AtomicU64::new(900);
+    let current_progress = AtomicU64::new(900);
         let regions_processed = AtomicU64::new(0);
+    let skipped_writes = AtomicU64::new(0);
 
-        self.world
-            .regions
-            .par_iter()
-            .for_each(|((region_x, region_z), region_to_modify)| {
-                let mut region = self.create_region(*region_x, *region_z);
-                let mut ser_buffer = Vec::with_capacity(8192);
+        // Configure worker threads for saving. Allow override via env var `ARNIS_SAVE_THREADS`.
+        let default_threads = std::cmp::min(
+            4,
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+        );
+        let threads: usize = std::env::var("ARNIS_SAVE_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default_threads);
+
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("Failed to build thread pool for saving");
+
+        pool.install(|| {
+            self.world
+                .regions
+                .par_iter()
+                .for_each(|((region_x, region_z), region_to_modify)| {
+                // 1) Read existing chunks and build merged in-memory chunk structs (sequential reads)
+                let mut chunk_metas: Vec<(usize, usize, Vec<u8>, Chunk)> = Vec::new();
+                let mut existing_on_disk: HashSet<(usize, usize)> = HashSet::new();
+
+                // We need a local Region reference for reads
+                let mut region_for_reads = self.create_region(*region_x, *region_z);
 
                 for (&(chunk_x, chunk_z), chunk_to_modify) in &region_to_modify.chunks {
                     if !chunk_to_modify.sections.is_empty() || !chunk_to_modify.other.is_empty() {
                         // Read existing chunk data if it exists
-                        let existing_data = region
+                        let existing_data = region_for_reads
                             .read_chunk(chunk_x as usize, chunk_z as usize)
                             .unwrap()
                             .unwrap_or_default();
+
+                        if !existing_data.is_empty() {
+                            existing_on_disk.insert((chunk_x as usize, chunk_z as usize));
+                        }
 
                         // Parse existing chunk or create new one
                         let mut chunk: Chunk = if !existing_data.is_empty() {
@@ -835,12 +822,10 @@ impl<'a> WorldEditor<'a> {
                             if let Some(existing_section) =
                                 chunk.sections.iter_mut().find(|s| s.y == new_section.y)
                             {
-                                // Merge block states
                                 existing_section.block_states.palette =
                                     new_section.block_states.palette;
                                 existing_section.block_states.data = new_section.block_states.data;
                             } else {
-                                // Add new section if it doesn't exist
                                 chunk.sections.push(new_section);
                             }
                         }
@@ -852,7 +837,6 @@ impl<'a> WorldEditor<'a> {
                                 if let (Value::List(existing), Value::List(new)) =
                                     (existing_entities, new_entities)
                                 {
-                                    // Remove old entities that are replaced by new ones
                                     existing.retain(|e| {
                                         if let Value::Compound(map) = e {
                                             let (x, y, z) = get_entity_coords(map);
@@ -868,53 +852,81 @@ impl<'a> WorldEditor<'a> {
                                             true
                                         }
                                     });
-                                    // Add new entities
                                     existing.extend(new.clone());
                                 }
                             }
-                        } else {
-                            // If no existing entities, just add the new ones
-                            if let Some(new_entities) = chunk_to_modify.other.get("block_entities")
-                            {
-                                chunk
-                                    .other
-                                    .insert("block_entities".to_string(), new_entities.clone());
-                            }
+                        } else if let Some(new_entities) = chunk_to_modify.other.get("block_entities") {
+                            chunk.other.insert("block_entities".to_string(), new_entities.clone());
                         }
 
                         // Update chunk coordinates and flags
                         chunk.x_pos = chunk_x + (region_x * 32);
                         chunk.z_pos = chunk_z + (region_z * 32);
 
-                        // Create Level wrapper and save
-                        let level_data = create_level_wrapper(&chunk);
-                        ser_buffer.clear();
-                        fastnbt::to_writer(&mut ser_buffer, &level_data).unwrap();
-                        region
-                            .write_chunk(chunk_x as usize, chunk_z as usize, &ser_buffer)
-                            .unwrap();
+                        chunk_metas.push((chunk_x as usize, chunk_z as usize, existing_data, chunk));
                     }
                 }
 
-                // Second pass: ensure all chunks exist
+                // 2) Spawn a writer thread that owns the real Region and receives serialized buffers
+                let (tx, rx) = sync_channel::<(usize, usize, Vec<u8>)>(8);
+                // Move the real region into the writer thread
+                let mut region_for_writes = self.create_region(*region_x, *region_z);
+                let writer_handle = std::thread::spawn(move || {
+                    for (cx, cz, buf) in rx.iter() {
+                        region_for_writes.write_chunk(cx, cz, &buf).unwrap();
+                    }
+                });
+
+                // 3) Parallel-serialize chunk_metas and send write tasks to writer thread
+                chunk_metas
+                    .into_par_iter()
+                    .for_each_with(tx.clone(), |s_tx, meta| {
+                        let (chunk_x, chunk_z, existing_data, chunk) = meta;
+                        let mut ser_buf = Vec::with_capacity(8192);
+                        let lw = LevelWrapper { level: &chunk };
+                        fastnbt::to_writer(&mut ser_buf, &lw).unwrap();
+
+                        if existing_data == ser_buf {
+                            skipped_writes.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            s_tx.send((chunk_x, chunk_z, ser_buf)).unwrap();
+                        }
+                    });
+
+                // 4) Ensure base chunks exist; create base chunks and send to writer if needed
                 for chunk_x in 0..32 {
                     for chunk_z in 0..32 {
                         let abs_chunk_x = chunk_x + (region_x * 32);
                         let abs_chunk_z = chunk_z + (region_z * 32);
 
-                        // Check if chunk exists in our modifications
-                        let chunk_exists =
-                            region_to_modify.chunks.contains_key(&(chunk_x, chunk_z));
-
-                        // If chunk doesn't exist, create it with base layer
-                        if !chunk_exists {
-                            let (ser_buffer, _) = Self::create_base_chunk(abs_chunk_x, abs_chunk_z);
-                            region
-                                .write_chunk(chunk_x as usize, chunk_z as usize, &ser_buffer)
-                                .unwrap();
+                        let chunk_exists_in_mod = region_to_modify.chunks.contains_key(&(chunk_x, chunk_z));
+                        if chunk_exists_in_mod {
+                            continue;
                         }
+
+                        if existing_on_disk.contains(&(chunk_x as usize, chunk_z as usize)) {
+                            continue;
+                        }
+
+                        // Check disk once more (we no longer have region_for_reads after earlier),
+                        // so reuse region_for_reads for this short read check.
+                        let existing_data = region_for_reads
+                            .read_chunk(chunk_x as usize, chunk_z as usize)
+                            .unwrap()
+                            .unwrap_or_default();
+
+                        if !existing_data.is_empty() {
+                            continue;
+                        }
+
+                        let (ser_buffer, _) = Self::create_base_chunk(abs_chunk_x, abs_chunk_z);
+                        tx.send((chunk_x as usize, chunk_z as usize, ser_buffer)).unwrap();
                     }
                 }
+
+                // Close the sender so writer thread exits and join
+                drop(tx);
+                writer_handle.join().unwrap();
 
                 // Update progress
                 let regions_done = regions_processed.fetch_add(1, Ordering::SeqCst);
@@ -928,7 +940,12 @@ impl<'a> WorldEditor<'a> {
 
                 save_pb.inc(1);
             });
+        });
 
+        let skipped = skipped_writes.load(Ordering::SeqCst);
+        if skipped > 0 {
+            eprintln!("Skipped {skipped} identical chunk writes during save");
+        }
         save_pb.finish();
     }
 }
@@ -954,69 +971,4 @@ fn get_entity_coords(entity: &HashMap<String, Value>) -> (i32, i32, i32) {
     (x, y, z)
 }
 
-#[inline]
-fn create_level_wrapper(chunk: &Chunk) -> HashMap<String, Value> {
-    HashMap::from([(
-        "Level".to_string(),
-        Value::Compound(HashMap::from([
-            ("xPos".to_string(), Value::Int(chunk.x_pos)),
-            ("zPos".to_string(), Value::Int(chunk.z_pos)),
-            (
-                "isLightOn".to_string(),
-                Value::Byte(i8::try_from(chunk.is_light_on).unwrap()),
-            ),
-            (
-                "sections".to_string(),
-                Value::List(
-                    chunk
-                        .sections
-                        .iter()
-                        .map(|section| {
-                            Value::Compound(HashMap::from([
-                                ("Y".to_string(), Value::Byte(section.y)),
-                                (
-                                    "block_states".to_string(),
-                                    Value::Compound(HashMap::from([
-                                        (
-                                            "palette".to_string(),
-                                            Value::List(
-                                                section
-                                                    .block_states
-                                                    .palette
-                                                    .iter()
-                                                    .map(|item| {
-                                                        let mut palette_item = HashMap::from([(
-                                                            "Name".to_string(),
-                                                            Value::String(item.name.clone()),
-                                                        )]);
-                                                        if let Some(props) = &item.properties {
-                                                            palette_item.insert(
-                                                                "Properties".to_string(),
-                                                                props.clone(),
-                                                            );
-                                                        }
-                                                        Value::Compound(palette_item)
-                                                    })
-                                                    .collect(),
-                                            ),
-                                        ),
-                                        (
-                                            "data".to_string(),
-                                            Value::LongArray(
-                                                section
-                                                    .block_states
-                                                    .data
-                                                    .clone()
-                                                    .unwrap_or_else(|| LongArray::new(vec![])),
-                                            ),
-                                        ),
-                                    ])),
-                                ),
-                            ]))
-                        })
-                        .collect(),
-                ),
-            ),
-        ])),
-    )])
-}
+

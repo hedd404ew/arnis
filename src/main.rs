@@ -27,6 +27,7 @@ use std::{env, fs, io::Write};
 mod elevation_data;
 #[cfg(feature = "gui")]
 mod gui;
+mod batching;
 
 // If the user does not want the GUI, it's easiest to just mock the progress module to do nothing
 #[cfg(not(feature = "gui"))]

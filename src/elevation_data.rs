@@ -11,6 +11,10 @@ const AWS_TERRARIUM_URL: &str =
     "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png";
 /// Terrarium format offset for height decoding
 const TERRARIUM_OFFSET: f64 = 32768.0;
+/// Maximum allowed total grid cells (width * height) to avoid huge allocations
+const MAX_GRID_CELLS: usize = 25_000_000; // ~25 million cells (~200MB for f64)
+/// Maximum kernel size for Gaussian blur (must be odd)
+const MAX_KERNEL_SIZE: usize = 201;
 /// Minimum zoom level for terrain tiles
 const MIN_ZOOM: u8 = 10;
 /// Maximum zoom level for terrain tiles
@@ -61,8 +65,26 @@ pub fn fetch_elevation_data(
     let tiles: Vec<(u32, u32)> = get_tile_coordinates(bbox, zoom);
 
     // Match grid dimensions with Minecraft world size
-    let grid_width: usize = scale_factor_x as usize;
-    let grid_height: usize = scale_factor_z as usize;
+    let mut grid_width: usize = scale_factor_x as usize;
+    let mut grid_height: usize = scale_factor_z as usize;
+
+    // Prevent excessive allocations by capping total grid cells. If exceeded,
+    // progressively reduce resolution (coarsen scale) until under the cap.
+    let mut total_cells = grid_width.saturating_mul(grid_height);
+    if total_cells == 0 {
+        return Err("Requested elevation grid has zero size".into());
+    }
+    let mut coarsen_factor: usize = 1;
+    while total_cells > MAX_GRID_CELLS {
+        coarsen_factor = coarsen_factor.saturating_mul(2).max(2);
+        grid_width = (grid_width + 1) / 2; // roughly halve dimensions
+        grid_height = (grid_height + 1) / 2;
+        total_cells = grid_width.saturating_mul(grid_height);
+        eprintln!("Grid too large, coarsening elevation grid resolution by factor {} -> {}x{} ({} cells)", coarsen_factor, grid_width, grid_height, total_cells);
+        if grid_width == 0 || grid_height == 0 {
+            return Err("Coarsening resulted in zero-sized elevation grid".into());
+        }
+    }
 
     // Initialize height grid with proper dimensions
     let mut height_grid: Vec<Vec<f64>> = vec![vec![f64::NAN; grid_width]; grid_height];
@@ -199,7 +221,9 @@ pub fn fetch_elevation_data(
     ); */
 
     // Continue with the existing blur and conversion to Minecraft heights...
-    let blurred_heights: Vec<Vec<f64>> = apply_gaussian_blur(&height_grid, sigma);
+    // Use a memory-efficient blur that caps kernel size and performs two-pass separable convolution
+    // Pass ownership of height_grid so the blur function can reuse its buffer and avoid a third full-size allocation
+    let blurred_heights: Vec<Vec<f64>> = apply_gaussian_blur_memory_efficient(height_grid, sigma);
 
     let mut mc_heights: Vec<Vec<i32>> = Vec::with_capacity(blurred_heights.len());
 
@@ -302,72 +326,97 @@ fn get_tile_coordinates(bbox: &LLBBox, zoom: u8) -> Vec<(u32, u32)> {
     tiles
 }
 
-fn apply_gaussian_blur(heights: &[Vec<f64>], sigma: f64) -> Vec<Vec<f64>> {
-    let kernel_size: usize = (sigma * 3.0).ceil() as usize * 2 + 1;
-    let kernel: Vec<f64> = create_gaussian_kernel(kernel_size, sigma);
-
-    // Apply blur
-    let mut blurred: Vec<Vec<f64>> = heights.to_owned();
-
-    // Horizontal pass
-    for row in blurred.iter_mut() {
-        let mut temp: Vec<f64> = row.clone();
-        for (i, val) in temp.iter_mut().enumerate() {
-            let mut sum: f64 = 0.0;
-            let mut weight_sum: f64 = 0.0;
-            for (j, k) in kernel.iter().enumerate() {
-                let idx: i32 = i as i32 + j as i32 - kernel_size as i32 / 2;
-                if idx >= 0 && idx < row.len() as i32 {
-                    sum += row[idx as usize] * k;
-                    weight_sum += k;
-                }
-            }
-            *val = sum / weight_sum;
-        }
-        *row = temp;
+fn apply_gaussian_blur_memory_efficient(mut heights: Vec<Vec<f64>>, sigma: f64) -> Vec<Vec<f64>> {
+    // Defensive: ensure grid is non-empty
+    if heights.is_empty() || heights[0].is_empty() {
+        return heights;
     }
 
-    // Vertical pass
-    let height: usize = blurred.len();
-    let width: usize = blurred[0].len();
+    // Clamp sigma to a small positive value to avoid zero division
+    let sigma = sigma.max(0.5);
+
+    // Cap kernel size to avoid huge per-pixel work
+    let mut kernel_size: usize = ((sigma * 3.0).ceil() as usize).saturating_mul(2).saturating_add(1);
+    if kernel_size == 0 {
+        kernel_size = 1;
+    }
+    if kernel_size > MAX_KERNEL_SIZE {
+        eprintln!("Capping gaussian kernel size from {} to {}", kernel_size, MAX_KERNEL_SIZE);
+        kernel_size = MAX_KERNEL_SIZE;
+    }
+    let kernel: Vec<f64> = create_gaussian_kernel_capped(kernel_size, sigma);
+
+    let height = heights.len();
+    let width = heights[0].len();
+
+    // Horizontal pass -> allocate one full-size horiz buffer (we will reuse `heights` as the final output buffer)
+        // Use f32 for this intermediate buffer to save ~50% memory compared to f64.
+        let mut horiz_blurred: Vec<Vec<f32>> = vec![vec![f32::NAN; width]; height];
+    let half = (kernel_size / 2) as i32;
+    for y in 0..height {
+        for x in 0..width {
+            let mut sum = 0.0;
+            let mut wsum = 0.0;
+            for k in 0..kernel_size {
+                let ix = x as i32 + k as i32 - half;
+                if ix >= 0 && ix < width as i32 {
+                        let val = heights[y][ix as usize];
+                        if val.is_finite() {
+                            // accumulate in f64 for precision, store as f32
+                            sum += val * kernel[k];
+                            wsum += kernel[k];
+                        }
+                }
+            }
+                let blurred_val = if wsum > 0.0 { sum / wsum } else { f64::NAN };
+                horiz_blurred[y][x] = blurred_val as f32;
+        }
+    }
+
+    // Vertical pass: reuse the owned `heights` buffer for the output so we don't allocate a third full grid
+        // col_buf uses f32 to match horiz_blurred
+        let mut col_buf: Vec<f32> = vec![f32::NAN; height];
     for x in 0..width {
-        let temp: Vec<_> = blurred
-            .iter()
-            .take(height)
-            .map(|row: &Vec<f64>| row[x])
-            .collect();
-
-        for (y, row) in blurred.iter_mut().enumerate().take(height) {
-            let mut sum: f64 = 0.0;
-            let mut weight_sum: f64 = 0.0;
-            for (j, k) in kernel.iter().enumerate() {
-                let idx: i32 = y as i32 + j as i32 - kernel_size as i32 / 2;
-                if idx >= 0 && idx < height as i32 {
-                    sum += temp[idx as usize] * k;
-                    weight_sum += k;
+        // copy column into temporary buffer
+        for y in 0..height {
+            col_buf[y] = horiz_blurred[y][x];
+        }
+        for y in 0..height {
+            let mut sum = 0.0;
+            let mut wsum = 0.0;
+            for k in 0..kernel_size {
+                let iy = y as i32 + k as i32 - half;
+                if iy >= 0 && iy < height as i32 {
+                        let val = col_buf[iy as usize] as f64;
+                        if val.is_finite() {
+                            sum += val * kernel[k];
+                            wsum += kernel[k];
+                        }
                 }
             }
-            row[x] = sum / weight_sum;
+                heights[y][x] = if wsum > 0.0 { sum / wsum } else { f64::NAN };
         }
     }
 
-    blurred
+    // horiz_blurred drops here, reducing peak memory
+    heights
 }
 
-fn create_gaussian_kernel(size: usize, sigma: f64) -> Vec<f64> {
-    let mut kernel: Vec<f64> = vec![0.0; size];
-    let center: f64 = size as f64 / 2.0;
-
-    for (i, value) in kernel.iter_mut().enumerate() {
-        let x: f64 = i as f64 - center;
-        *value = (-x * x / (2.0 * sigma * sigma)).exp();
+fn create_gaussian_kernel_capped(size: usize, sigma: f64) -> Vec<f64> {
+    let size = if size == 0 { 1 } else { size };
+    let sigma = sigma.max(1e-6);
+    let center: f64 = (size - 1) as f64 / 2.0;
+    let mut kernel: Vec<f64> = Vec::with_capacity(size);
+    for i in 0..size {
+        let x = i as f64 - center;
+        kernel.push((-x * x / (2.0 * sigma * sigma)).exp());
     }
-
     let sum: f64 = kernel.iter().sum();
-    for k in kernel.iter_mut() {
-        *k /= sum;
+    if sum > 0.0 {
+        for k in kernel.iter_mut() {
+            *k /= sum;
+        }
     }
-
     kernel
 }
 

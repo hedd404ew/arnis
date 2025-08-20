@@ -573,6 +573,11 @@ fn gui_start_generation(
                 fillground: fillground_enabled,
                 debug: false,
                 timeout: Some(std::time::Duration::from_secs(floodfill_timeout)),
+                tile_size: 512,
+                resume_file: None,
+                    max_parallel_tiles: 1,
+                    worker: false,
+                    tile_file: None,
             };
 
             // Run data fetch and world generation
